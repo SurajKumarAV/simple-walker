@@ -19,9 +19,13 @@ class Parameters:
     com_dist   : float = 0.5   # from the hip
     slope      : float = 0.01    
 
+
 class DataLogger:
     def __init__(self):
         self.data = {}
+        self.fig = None
+        self.ax = None
+        self.fps = 10
 
     def log_data(self,**kwargs):
         for parameter, value in kwargs.items():
@@ -37,19 +41,23 @@ class DataLogger:
         omega_stance = [state[1] for state in states]
         th_stance_swing = [state[2] for state in states]
         omega_stance_swing = [state[3] for state in states]
+        collision_val    = [state[2]+2*state[0] for state in states]
         xh =[hip_coordinate[0] for hip_coordinate in hip_coordinates]
         yh =[hip_coordinate[1] for hip_coordinate in hip_coordinates]
         
         plt.figure()
         plt.subplot(2,1,1)
-        plt.plot(times,th_stance,'r--')
-        plt.plot(times,th_stance_swing,'b')
+        plt.plot(times,th_stance,'k--')
+        plt.plot(times,th_stance_swing,'r')
         plt.ylabel('theta')
         plt.subplot(2,1,2)
-        plt.plot(times,omega_stance,'r--')
-        plt.plot(times,omega_stance_swing,'b')
+        plt.plot(times,omega_stance,'k--')
+        plt.plot(times,omega_stance_swing,'r')
         plt.ylabel('thetadot')
         plt.xlabel('time')
+        
+        plt.figure()
+        plt.plot(times,collision_val,'k')
 
         plt.figure()
         plt.subplot(2,1,1)
@@ -70,95 +78,95 @@ class DataLogger:
             state = states[i]
             print(f"Time: {time}, State: {state}")
     
-    def animate_data(self,model):
-        pass
+    def animate_data(self):
+        if self.fig is None and self.ax is None:
+            # Create the figure and axes for the initial render
+            self.fig, self.ax = plt.subplots()
+            self.ax.set_aspect('equal')
+            xmin = -1 
+            xmax = 10
+            ymin = -0.1
+            ymax = 2
+            self.ax.set_xlim(-1, 10)  # Adjust the limits as needed
+            self.ax.set_ylim(-0.1, 2)  # Adjust the limits as needed
+            self.ax.set_xlabel('X')
+            self.ax.set_ylabel('Y')
+            self.ax.set_title('2D Walker')
+            ramp, = self.ax.plot([xmin, xmax],[0,0],linewidth=1, color='blue')
+
+        times                           = self.data['time']
+        states                          = np.stack(self.data['states'])
+        hip_coordinates                 = np.stack(self.data['hip_coordinates'])
+        stance_foot_coordinates         = np.stack(self.data['stance_foot_coordinates'])
+        swing_foot_coordinates          = np.stack(self.data['swing_foot_coordinates'])   
+        z = np.concatenate((states,stance_foot_coordinates,hip_coordinates, swing_foot_coordinates), axis=1)
+        t =[time for time in times]
+        data_pts = 1/self.fps
+        t_interp = np.arange(t[0],t[len(t)-1],data_pts)
+        [m,n] = np.shape(z)
+        shape = (len(t_interp),n)
+        z_interp = np.zeros(shape)
+        for i in range(0,n):
+            f = interpolate.interp1d(t, z[:,i])
+            z_interp[:,i] = f(t_interp)
+        for i in range(0,len(t_interp)):
+            C1     = z_interp[i,4:6]
+            H      = z_interp[i,6:8]
+            C2     = z_interp[i,8:10]
+            hip, = self.ax.plot(H[0],H[1],color='black',marker='o',markersize=10)
+            leg1, = self.ax.plot([H[0], C1[0]],[H[1], C1[1]],linewidth=5, color='green')
+            leg2, = self.ax.plot([H[0], C2[0]],[H[1], C2[1]],linewidth=5, color='green')
+            plt.pause(0.01)
+            
+            if (i<len(t_interp)-1):
+                hip.remove()
+                leg1.remove()
+                leg2.remove()
+        plt.show()
     
-class CompassGaitModel:
+class CompassGaitWalker:
     def __init__(self,p = Parameters()):
         self.params = p
         self._stance_foot_coordinates = [0,0]
-        self.ankle_pushoff = 0  
-        self.hip_torque = 0  
-        self.render_mode = 1
         self.log_enable = 0
-        self.fps = 10
+        self.fps = 5
         self.fig = None
         self.ax = None
         self.logger = DataLogger()
-        
-    def one_gait_step(self,t0,z0):
-        # integrates the equation of motion from one footstrike to another footstrike - one complete gait cycle
-        tf = t0+4
-        t = np.linspace(t0, tf, 1001)
-        event_fun = lambda t, y: self.detect_collision(t, y)
-        event_fun.terminal = True
-        sol = solve_ivp(self.single_stance_dynamics,[t0, tf],z0,method='RK45', t_eval=t, dense_output=True, \
-                    events=event_fun, atol = 1e-13,rtol = 1e-12)
+        self.dt = 0.001
+        self.collision_event = False
+        self.gstop_value = 0
+        self.prev_gstop_value = 0
 
-        [m,n] = np.shape(sol.y)
-        shape = (n,m)
-        t = sol.t
-        z = np.zeros(shape)
-
-        [mm,nn,pp] = np.shape(sol.y_events)
-        tt_last_event = sol.t_events[mm-1]
-        yy_last_event = sol.y_events[mm-1]
-
-        for i in range(0,m):
-            z[:,i] = sol.y[i,:]
-
-        t_end = tt_last_event[0]
-        theta1 = yy_last_event[0,0]
-        omega1 = yy_last_event[0,1]
-        theta2 = yy_last_event[0,2]
-        omega2 = yy_last_event[0,3]
-
-        zminus = np.array([theta1, omega1, theta2, omega2 ])
-
-        self.z_bfs = zminus 
-        self._footstrike_coordinates = self._get_footstrike_coordinates(self.z_bfs[0],self.z_bfs[2])
-        zplus = self.impact_map(t_end,zminus)
-
-        t[n-1] = t_end
-        z[n-1,0] = zplus[0];
-        z[n-1,1] = zplus[1];
-        z[n-1,2] = zplus[2];
-        z[n-1,3] = zplus[3];
-
-        # if (self.render_mode == 1):
-        #     self.render(t,z)
-        # self._update_stance_foot_coordinates()
-        return t,z
-        
-    def simulate(self,t0,z0,n_steps=5):
-        #call from main to simulate the model
-        tc = t0
-        zc = z0
-        t_list = [tc]
-        z_list = np.array(zc).reshape(1,4)
-        for i in range(n_steps):
-            [t1,z1] = self.one_gait_step(tc,zc)
-            if (self.log_enable == 1):
-                for i in range(len(t1)-1):
-                    
-                    data = {
-                            'time': t1[i],
-                            'states': z1[i],
-                            'hip_coordinates': self._get_hip_coordinates(z1[i,0],z1[i,2]),
-                            'stance_foot_coordinates' : self._stance_foot_coordinates,
-                            'swing_foot_coordinates'  : self._get_footstrike_coordinates(z1[i,0],z1[i,2])
-                        }
-                    self.logger.log_data(**data)
-            if (self.render_mode == 1):
-                self.render(t1,z1)
+    def step(self,t,z,u):
+        # one step of integration  for dt time for given control u(hip torque, pushoff force)
+        if self.log_enable:
+            data = {
+                    'time': t,
+                    'states': z,
+                    'hip_coordinates': self._get_hip_coordinates(z[0],z[2]),
+                    'stance_foot_coordinates' : self._stance_foot_coordinates,
+                    'swing_foot_coordinates'  : self._get_footstrike_coordinates(z[0],z[2])
+                    }
+            self.logger.log_data(**data)
+        znext = np.array([0,0,0,0],dtype=float)
+        dz = self.single_stance_dynamics(t,z,u)
+        for i in range(len(z)):
+            znext[i] = z[i] + dz[i]*self.dt
+        self.collision_event = False
+        self.gstop_value = self.detect_collision(t,znext)
+        if (self.gstop_value != 1) and (detect_zero_crossing(self.prev_gstop_value) != detect_zero_crossing(self.gstop_value)):
+            self.collision_event = True
+            zminus = znext
+            self.z_bfs = zminus 
+            self._footstrike_coordinates = self._get_footstrike_coordinates(self.z_bfs[0],self.z_bfs[2])
+            zplus = self.impact_map(t,zminus)
+            znext = zplus
             self._update_stance_foot_coordinates()
-            tc = t1[-1]
-            zc = z1[-1,:] 
-            t_list.extend(t1)
-            z_list = np.concatenate((z_list,z1),axis=0) 
-        return t_list, z_list  
-    
-    def single_stance_dynamics(self,t,z):
+        self.prev_gstop_value = self.gstop_value
+        return znext
+        
+    def single_stance_dynamics(self,t,z,u=[0,0]):
         # implementation of single stance dynamics
         
         th_stance,omega_stance,the_stance_swing,omega_stance_swing = z
@@ -179,7 +187,7 @@ class CompassGaitModel:
                 - c*g*m*math.sin(-slope + th_stance + the_stance_swing) \
                 - 2*c*l*m*omega_stance*omega_stance_swing*math.sin(the_stance_swing) - c*l*m*omega_stance_swing**2*math.sin(the_stance_swing) \
                 - 2*g*l*m*math.sin(slope - th_stance)
-        b2 =  1.0*c*m*(-g*math.sin(-slope + th_stance + the_stance_swing) + l*omega_stance**2*math.sin(the_stance_swing)) 
+        b2 =  1.0*c*m*(-g*math.sin(-slope + th_stance + the_stance_swing) + l*omega_stance**2*math.sin(the_stance_swing)) + u[0]
 
         A_ss = np.array([[A11,A12],[A21,A22]])
         b_ss = np.array([b1,b2])
@@ -247,55 +255,13 @@ class CompassGaitModel:
 
     def detect_collision(self,t,z):
         
-        th_stance,omega_stance,th_stance_swing,omega_stance = z
-        gstop = th_stance_swing + 2*th_stance
+        th_stance,omega_stance,th_stance_swing,omega_stance_swing = z
+        #gstop = th_stance_swing + 2*th_stance
         if (th_stance > -0.05):
             gstop = 1
         else:
             gstop = th_stance_swing + 2*th_stance
-        return gstop
-    
-    def render(self,t,z):
-        if self.fig is None and self.ax is None:
-            # Create the figure and axes for the initial render
-            self.fig, self.ax = plt.subplots()
-            self.ax.set_aspect('equal')
-            xmin = -1 
-            xmax = 10
-            ymin = -0.1
-            ymax = 2
-            self.ax.set_xlim(-1, 10)  # Adjust the limits as needed
-            self.ax.set_ylim(-0.1, 2)  # Adjust the limits as needed
-            self.ax.set_xlabel('X')
-            self.ax.set_ylabel('Y')
-            self.ax.set_title('Compass Gait Walker')
-            ramp, = self.ax.plot([xmin, xmax],[0,0],linewidth=1, color='blue')
-
-       
-        data_pts = 1/self.fps
-        t_interp = np.arange(t[0],t[len(t)-1],data_pts)
-        [m,n] = np.shape(z)
-        shape = (len(t_interp),n)
-        z_interp = np.zeros(shape)
-        for i in range(0,n):
-            f = interpolate.interp1d(t, z[:,i])
-            z_interp[:,i] = f(t_interp)
-        l = self.params.leg_length
-        c = self.params.com_dist
-        for i in range(0,len(t_interp)):
-            theta1 = z_interp[i,0]
-            theta2 = z_interp[i,2]
-            C1 = self._stance_foot_coordinates
-            H = self._get_hip_coordinates(theta1,theta2)
-            C2 = self._get_footstrike_coordinates(theta1,theta2)
-            hip, = self.ax.plot(H[0],H[1],color='black',marker='o',markersize=10)
-            leg1, = self.ax.plot([H[0], C1[0]],[H[1], C1[1]],linewidth=5, color='green')
-            leg2, = self.ax.plot([H[0], C2[0]],[H[1], C2[1]],linewidth=5, color='green')
-            plt.pause(0.01)
-            
-            hip.remove()
-            leg1.remove()
-            leg2.remove()      
+        return gstop      
         
     def _get_hip_coordinates(self,th_stance,th_stance_swing):
         l = self.params.leg_length
@@ -310,7 +276,103 @@ class CompassGaitModel:
     def _update_stance_foot_coordinates(self):
         self._stance_foot_coordinates = self._footstrike_coordinates
     
-                
+    def render(self):
+        pass
+    
+    def reset(self):
+        pass
+    
+class SimplestWalker:
+    def __init__(self,p = Parameters()):
+        self.params = p
+        self._stance_foot_coordinates = [0,0]
+        self.log_enable = 0
+        self.fps = 10
+        self.fig = None
+        self.ax = None
+        self.logger = DataLogger()
+        self.dt = 0.001
+        self.collision_event = False
+        self.gstop_value = 0
+        self.prev_gstop_value = 0
+        
+    def step(self,t,z,u):
+        # one step of integration  for dt time for given control u(hip torque, pushoff force)
+        if self.log_enable:
+            data = {
+                    'time': t,
+                    'states': z,
+                    'hip_coordinates': self._get_hip_coordinates(z[0],z[2]),
+                    'stance_foot_coordinates' : self._stance_foot_coordinates,
+                    'swing_foot_coordinates'  : self._get_footstrike_coordinates(z[0],z[2])
+                    }
+            self.logger.log_data(**data)
+        znext = np.array([0,0,0,0],dtype=float)
+        dz = self.single_stance_dynamics(t,z,u)
+        for i in range(len(z)):
+            znext[i] = z[i] + dz[i]*self.dt
+        self.collision_event = False
+        self.gstop_value = self.detect_collision(t,znext)
+        if (self.gstop_value != 1) and (detect_zero_crossing(self.prev_gstop_value) != detect_zero_crossing(self.gstop_value)):        
+            self.collision_event = True
+            zminus = znext
+            self.z_bfs = zminus 
+            self._footstrike_coordinates = self._get_footstrike_coordinates(self.z_bfs[0],self.z_bfs[2])
+            zplus = self.impact_map(t,zminus)
+            znext = zplus
+            self._update_stance_foot_coordinates()
+        self.prev_gstop_value = self.gstop_value
+        return znext
+    def single_stance_dynamics(self,t,z,u=[0,0]):
+        # implementation of single stance dynamics
+        
+        the,thedot,phi,phidot = z
+        slope = self.params.slope
+        
+        theddot = math.sin(the-slope)
+        phiddot = -math.sin(the-slope) + (thedot**2 - math.cos(the-slope))*math.sin(phi) + u[0]
+        return [thedot,theddot,phidot,phiddot]
+    
+    def impact_map(self,t,z):
+        # implementation of collision equation and configuration variables name change
+        the,thedot,phi,phidot = z
+        the_plus    = -the
+        thedot_plus = math.cos(2*the)*thedot
+        phi_plus    = 2*the
+        phidot_plus = -(1-math.cos(2*the))*thedot_plus
+        return [the_plus,thedot_plus,phi_plus,phidot_plus]
 
+    def detect_collision(self,t,z):
+        
+        the,thedot,phi,phidot = z
+        #gstop = th_stance_swing + 2*th_stance
+        if (the > -0.05):
+            gstop = 1
+        else:
+            gstop = phi + 2*the
+        return gstop      
+        
+    def _get_hip_coordinates(self,th_stance,th_stance_swing):
+        l = self.params.leg_length
+        return np.array([self._stance_foot_coordinates[0]-l*math.sin(th_stance), self._stance_foot_coordinates[1] + l*math.cos(th_stance)])
+    
+    def _get_footstrike_coordinates(self,th_stance,th_stance_swing):
+        l = self.params.leg_length
+        x_swing = l*(math.sin(th_stance)*math.cos(th_stance_swing) + math.sin(th_stance_swing)*math.cos(th_stance)) - l*math.sin(th_stance) + self._stance_foot_coordinates[0]
+        y_swing = l*(math.sin(th_stance)*math.sin(th_stance_swing) - math.cos(th_stance)*math.cos(th_stance_swing)) + l*math.cos(th_stance) + self._stance_foot_coordinates[1]
+        return np.array([x_swing,y_swing])
+    
+    def _update_stance_foot_coordinates(self):
+        self._stance_foot_coordinates = self._footstrike_coordinates
+        
+    def render(self):
+        pass
+    
+    def reset(self):
+        pass
+
+           
+def detect_zero_crossing(x):
+    return x > 0
 
     
